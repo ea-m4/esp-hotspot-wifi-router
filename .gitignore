@@ -1,0 +1,22 @@
+# ESP-IDF build output
+build/
+dependencies.lock
+managed_components/
+
+# Generated config — each developer runs `idf.py menuconfig` locally
+sdkconfig
+sdkconfig.old
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+
+# Editor / OS
+.vscode/settings.json
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
