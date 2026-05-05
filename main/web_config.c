@@ -7,6 +7,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_http_server.h"
+#include "esp_wifi.h"
 #include "esp_log.h"
 #include "lwip/inet.h"
 
@@ -58,11 +59,83 @@ static int parse_int_field(const char *body, const char *key, int def)
 }
 
 /* ====================================================================
+   WiFi scan endpoint  GET /scan
+   Returns JSON: [{"s":"SSID","r":-65,"o":false}, ...]
+     s = ssid, r = rssi, o = open (true = no password)
+   ==================================================================== */
+
+#define SCAN_MAX 20
+
+static void json_escape_ssid(const char *src, char *dst, size_t dst_len)
+{
+    size_t i = 0;
+    while (*src && i < dst_len - 2) {
+        unsigned char c = (unsigned char)*src++;
+        if      (c == '"')  { dst[i++] = '\\'; dst[i++] = '"';  }
+        else if (c == '\\') { dst[i++] = '\\'; dst[i++] = '\\'; }
+        else if (c >= 0x20) { dst[i++] = c; }
+    }
+    dst[i] = '\0';
+}
+
+static esp_err_t handler_get_scan(httpd_req_t *req)
+{
+    wifi_scan_config_t scan_cfg = {
+        .show_hidden          = false,
+        .scan_type            = WIFI_SCAN_TYPE_ACTIVE,
+        .scan_time.active.min = 100,
+        .scan_time.active.max = 300,
+    };
+    esp_wifi_scan_start(&scan_cfg, true);   /* blocking ~1-2 s */
+
+    uint16_t found = 0;
+    esp_wifi_scan_get_ap_num(&found);
+    if (found > SCAN_MAX) found = SCAN_MAX;
+
+    wifi_ap_record_t *aps = malloc(found * sizeof(wifi_ap_record_t));
+    if (!aps) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_OK;
+    }
+    esp_wifi_scan_get_ap_records(&found, aps);
+
+    /* Each entry: {"s":"<32-char-ssid>","r":-100,"o":false} ≤ 70 chars */
+    char *buf = malloc((size_t)found * 72 + 4);
+    if (!buf) {
+        free(aps);
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "OOM");
+        return ESP_OK;
+    }
+    char esc[68];
+    int  pos   = 0;
+    bool first = true;
+    buf[pos++] = '[';
+    for (uint16_t i = 0; i < found; i++) {
+        json_escape_ssid((char *)aps[i].ssid, esc, sizeof(esc));
+        if (esc[0] == '\0') continue;
+        if (!first) buf[pos++] = ',';
+        first = false;
+        pos += snprintf(buf + pos, 72, "{\"s\":\"%s\",\"r\":%d,\"o\":%s}",
+                        esc, aps[i].rssi,
+                        aps[i].authmode == WIFI_AUTH_OPEN ? "true" : "false");
+    }
+    buf[pos++] = ']';
+    buf[pos]   = '\0';
+    free(aps);
+
+    httpd_resp_set_type(req, "application/json");
+    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
+    httpd_resp_send(req, buf, HTTPD_RESP_USE_STRLEN);
+    free(buf);
+    return ESP_OK;
+}
+
+/* ====================================================================
    HTML template
    Format args (in order):
     1  %s  status_class ("online" / "offline")
     2  %s  status_text
-    3  %s  sta_ssid
+    3  %s  sta_ssid          (pre-fills text input)
     4  %s  sta_pass
     5  %s  ap_ssid
     6  %s  ap_pass
@@ -119,6 +192,11 @@ static const char HTML_TMPL[] =
     "border-radius:10px;font-size:1em;font-weight:600;cursor:pointer;"
     "margin-top:8px;transition:background .15s,transform .1s}"
     "button:active{background:#388E3C;transform:scale(.98)}"
+    /* Scan refresh button overrides the full-width save-button defaults */
+    "#rb{width:auto;padding:3px 10px;font-size:.77em;background:#e8f5e9;"
+    "color:#2e7d32;border:1px solid #a5d6a7;border-radius:6px;margin:0}"
+    "#rb:active{background:#c8e6c9;transform:scale(.97)}"
+    "#rb:disabled{opacity:.5;cursor:default}"
     ".note{font-size:.77em;color:#bbb;text-align:center;margin-top:10px;line-height:1.5}"
     ".ip{font-size:.78em;color:#ccc;margin-top:14px;text-align:center}"
     "</style></head><body>"
@@ -135,16 +213,25 @@ static const char HTML_TMPL[] =
     "<div class='status %s'><div class='dot'></div><span>%s</span></div>"
     "<form method='POST' action='/save'>"
 
+    /* ---- Upstream WiFi ---- */
     "<div class='card'>"
     "<h3>Upstream WiFi (internet source)</h3>"
-    "<label>Network name (SSID)</label>"
-    "<input type='text' name='sta_ssid' value='%s'"
-    " placeholder='Your router SSID' autocomplete='off' required>"
+    "<label style='display:flex;justify-content:space-between;align-items:center'>"
+    "Available networks"
+    "<button type='button' id='rb' onclick='doScan()'>&#x21BB; Scan</button>"
+    "</label>"
+    "<select id='sl' onchange='onPick(this)'>"
+    "<option>Scanning...</option>"
+    "</select>"
+    "<label>SSID <small style='color:#bbb;font-weight:400'>(or type manually)</small></label>"
+    "<input type='text' id='si' name='sta_ssid' value='%s'"
+    " placeholder='Select above or type SSID' autocomplete='off' required>"
     "<label>Password</label>"
     "<input type='password' name='sta_pass' value='%s'"
     " placeholder='Router password' autocomplete='new-password'>"
     "</div>"
 
+    /* ---- Hotspot ---- */
     "<div class='card'>"
     "<h3>Hotspot &mdash; this device</h3>"
     "<label>Hotspot name</label>"
@@ -158,6 +245,7 @@ static const char HTML_TMPL[] =
     "<input type='number' name='ap_max' value='%d' min='1' max='10'></div>"
     "</div></div>"
 
+    /* ---- DNS & Ad Blocking ---- */
     "<div class='card'>"
     "<h3>DNS &amp; Ad Blocking</h3>"
     "<label>DNS Server</label>"
@@ -193,9 +281,40 @@ static const char HTML_TMPL[] =
     "</form>"
     "<p class='ip'>http://192.168.4.1</p>"
     "<script>"
+    /* DNS custom field show/hide */
     "function upd(){document.getElementById('cr').style.display="
     "document.getElementById('dm').value==='3'?'block':'none';}"
-    "upd();"
+    /* Copy selected network name into the SSID text input */
+    "function onPick(s){if(s.value)document.getElementById('si').value=s.value;}"
+    /* Scan and populate the dropdown */
+    "function doScan(){"
+    "var sel=document.getElementById('sl'),btn=document.getElementById('rb');"
+    "sel.options.length=0;"
+    "var ld=document.createElement('option');ld.text='Scanning...';sel.add(ld);"
+    "btn.disabled=true;"
+    "fetch('/scan').then(function(r){return r.json();})"
+    ".then(function(aps){"
+    "sel.options.length=0;"
+    "var d=document.createElement('option');d.value='';d.text='-- select network --';sel.add(d);"
+    "var cur=document.getElementById('si').value;"
+    "aps.forEach(function(n){"
+    "var o=document.createElement('option');"
+    "o.value=n.s;"
+    /* Signal bars using Unicode filled/empty circles: ● = ●, ○ = ○ */
+    "o.text=n.s+' '+(n.r>-55?'\\u25cf\\u25cf\\u25cf\\u25cf'"
+    ":n.r>-65?'\\u25cf\\u25cf\\u25cf\\u25cb'"
+    ":n.r>-75?'\\u25cf\\u25cf\\u25cb\\u25cb'"
+    ":'\\u25cf\\u25cb\\u25cb\\u25cb');"
+    "if(n.s===cur)o.selected=true;"
+    "sel.add(o);"
+    "});"
+    "btn.disabled=false;"
+    "}).catch(function(){"
+    "sel.options.length=0;"
+    "var e=document.createElement('option');e.text='Scan failed - type SSID below';sel.add(e);"
+    "btn.disabled=false;"
+    "});}"
+    "upd();doScan();"
     "</script>"
     "</body></html>";
 
@@ -205,7 +324,7 @@ static const char HTML_TMPL[] =
 
 static esp_err_t handler_get_root(httpd_req_t *req)
 {
-    char *buf = malloc(6144);
+    char *buf = malloc(8192);
     if (!buf) return ESP_ERR_NO_MEM;
 
     const char *cls = wifi_bridge_sta_connected() ? "online" : "offline";
@@ -215,7 +334,7 @@ static esp_err_t handler_get_root(httpd_req_t *req)
            ? "Not configured &mdash; fill in upstream WiFi below"
            : "Connecting to upstream WiFi...");
 
-    snprintf(buf, 6144, HTML_TMPL,
+    snprintf(buf, 8192, HTML_TMPL,
         /* status   */ cls, txt,
         /* upstream */ g_cfg.sta_ssid, g_cfg.sta_pass,
         /* hotspot  */ g_cfg.ap_ssid,  g_cfg.ap_pass,
@@ -315,10 +434,14 @@ void webserver_start(void)
     static const httpd_uri_t uri_root = {
         .uri = "/", .method = HTTP_GET, .handler = handler_get_root
     };
+    static const httpd_uri_t uri_scan = {
+        .uri = "/scan", .method = HTTP_GET, .handler = handler_get_scan
+    };
     static const httpd_uri_t uri_save = {
         .uri = "/save", .method = HTTP_POST, .handler = handler_post_save
     };
     httpd_register_uri_handler(server, &uri_root);
+    httpd_register_uri_handler(server, &uri_scan);
     httpd_register_uri_handler(server, &uri_save);
 
     ESP_LOGI(TAG, "Config page  ->  http://192.168.4.1");
